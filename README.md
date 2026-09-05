@@ -1,0 +1,281 @@
+# 16 卡昇腾服务器部署 DeepSeek-V4-Flash：一次从“能启动”到“能稳定用”的实战手册
+
+> 面向 16 × Ascend 910B2C（64GB HBM）单机环境的非官方实战记录，重点不是复制一条启动命令，而是建立一套可验证、可回滚、能解释性能差异的部署方法。
+
+## 为什么写这份手册
+
+一台 16 卡服务器并不天然比一台 8 卡服务器“回复更快”。在实际推理服务中，模型版本、权重格式、容器镜像、并行策略、NUMA/HCCS 拓扑、KV Cache、批处理预算、投机解码和客户端请求参数会共同决定结果。
+
+本次排障经历了这些典型问题：
+
+- 容器显示 `running`，但重启次数已经达到数百次；
+- `/health` 返回 200，真实生成请求却长时间没有一个 token；
+- 16 卡全部占用，但单用户体验不如原来的 8 卡；
+- 512K 上下文在旧组合中可启动，换一个通用镜像后却提示 KV Cache 不足；
+- Reasonix/Agent 在一次 Web 工具调用后看似“模型不说话”；
+- `max_tokens` 被客户端放大到接近整个上下文窗口；
+- DSpark、ACL Graph、批处理大小同时变化，导致无法判断究竟是谁造成卡顿。
+
+最终稳定基线是：新版匹配权重与专用镜像、`TP=8 / DP=1`、512K 最大上下文、`max-num-batched-tokens=8192`、16 并发槽、DSpark 5-token 投机解码、`FULL_DECODE_ONLY` 图模式，以及服务端 64K 最大输出约束。
+
+## 最终架构
+
+```text
+客户端 / Agent
+      │ OpenAI-compatible API
+      ▼
+反向代理 / API Key 网关
+      │
+      ▼
+vLLM-Ascend :7000
+      │
+      ├── TP=8, DP=1
+      ├── NPU 0-7
+      ├── DeepSeek-V4-Flash-0731 W8A8 + DSpark
+      └── 512K context / 64K output cap
+
+NPU 8-15 保留给另一模型或第二服务实例
+```
+
+## 环境基线
+
+| 项目 | 本次环境 | 说明 |
+|---|---:|---|
+| NPU | 16 × Ascend 910B2C 64GB | 两组 8 卡适合分别形成 TP 域 |
+| CPU | 双路服务器 CPU，176 逻辑核 | 必须关注 NUMA 与 CPU affinity |
+| 内存 | 约 2TB，无 Swap | 模型加载空间充足 |
+| 数据盘 | 两块约 14TB NVMe/XFS | 权重与 Docker Root 分盘规划 |
+| 操作系统 | Ubuntu 22.04 / Linux 5.15 | 示例以 Bash、Docker Compose 为准 |
+| 驱动 | 26.x 系列 | 驱动、CANN、torch-npu、镜像需要成套验证 |
+| 最终镜像 | `quay.io/ascend/vllm-ascend:DeepSeekV4-flash-0731` | 不要只看 vLLM 主版本号 |
+| 最终权重 | DeepSeek-V4-Flash-0731 W8A8 DSpark | 约 293GiB，权重与镜像匹配 |
+
+> 版本变化很快。部署前应优先核对 [vLLM-Ascend 官方模型教程](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/) 和对应模型仓库，不要把某次成功参数当成永久兼容矩阵。
+
+## 先理解：为什么 16 卡不一定比 8 卡更快
+
+### TP 与 DP 优化的是不同目标
+
+- **Tensor Parallel（TP）**：一次请求跨多张卡计算。TP 越大，单卡模型分片越小，但每层的集合通信越多。
+- **Data Parallel（DP）**：复制多份模型，各自处理请求。DP 提升多请求总吞吐，但一个请求通常只进入其中一个副本。
+
+`TP=8, DP=2` 使用 16 张卡，本质是两套 8 卡推理副本。只有一个请求时，它不会把两个副本的计算力合并，因此单请求速度通常仍接近一套 8 卡，甚至可能因为路由、调度和资源绑定问题更差。
+
+```text
+TP=8, DP=2
+
+请求 A ──► DP0 ──► NPU 0-7
+请求 B ──► DP1 ──► NPU 8-15
+
+只有请求 A 时，NPU 8-15 不能自动帮助请求 A 解码。
+```
+
+### 拓扑比“卡数”更重要
+
+通过 `npu-smi info -t topo` 可以看到：同一 8 卡组内主要通过 HCCS 互联，而跨组通信可能经过 PIX、PHB 或 SYS。对每层都需要集合通信的 TP 来说，跨 NUMA/PCIe 域扩大到 TP16 很可能增加延迟。
+
+因此本次选择：先把单实例固定在一个 HCCS 8 卡域中（TP8），再把另外 8 卡分配给独立模型或独立服务。
+
+## 排障总流程
+
+### 1. 先确认服务究竟由谁启动
+
+不要看到容器名就直接重启。先检查 Compose 标签、镜像、入口命令、挂载和重启次数：
+
+```bash
+docker inspect -f \
+'Project={{index .Config.Labels "com.docker.compose.project"}} Service={{index .Config.Labels "com.docker.compose.service"}} Image={{.Config.Image}} RestartCount={{.RestartCount}}' \
+<container>
+
+docker inspect -f 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}}' <container>
+
+docker inspect -f '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' <container>
+```
+
+一个 `RestartCount` 很高的容器即使当前是 `running`，也不能视为稳定。需要继续检查最近一次启动时间、健康状态和日志。
+
+### 2. 验证模型目录，而不是只看目录大小
+
+一次中断的下载可能留下：
+
+- 已完成的 `.safetensors`；
+- 大量 `.incomplete`；
+- 顶层重复分片；
+- 真正可用的快照位于 `snapshots/<revision>`；
+- 缺失 tokenizer 或权重索引。
+
+检查示例：
+
+```bash
+MODEL_DIR=/srv/models/deepseek-v4
+
+find "$MODEL_DIR" -type f -name '*.incomplete' | wc -l
+find "$MODEL_DIR" -type f -name '*.safetensors' | wc -l
+du -sh "$MODEL_DIR"
+
+find "$MODEL_DIR" -maxdepth 2 -type f \
+  \( -name 'config.json' -o -name '*safetensors.index.json' -o -name 'tokenizer*' \) \
+  -printf '%p %s bytes\n'
+```
+
+目录很大不代表完整；容器挂载到了错误层级，同样会表现为“初始化很久”“tokenizer 不存在”或不断重启。
+
+### 3. 对齐权重与专用镜像
+
+本次旧权重约 279GiB，模型配置为 43 层、256 个路由专家、每 token 激活 6 个专家，并带一层 NextN/MTP。后来切换到官方配套的 0731 W8A8 DSpark 权重，约 293GiB。
+
+权重变大不等于模型更慢，也不等于显存一定线性增加。差异可能来自：
+
+- 分片数量与保存格式；
+- 哪些层采用 INT8，哪些仍保留 BF16；
+- MTP/DSpark 预测头；
+- 多模态或额外配置文件；
+- 量化元数据、scale 和索引文件。
+
+### 4. 512K 不是“预先为每个请求分配 512K KV”
+
+`--max-model-len 524288` 定义单请求输入加输出的上限。实际可承载并发还取决于模型架构、KV 数据类型、滑动窗口、混合缓存管理、权重占用和运行时实现。
+
+同一组权重换镜像后，曾出现：
+
+```text
+配置 512K 需要的 KV Cache > 实际可用 KV Cache
+估算最大上下文仅约 51K
+```
+
+这不是“64GB 卡突然少了显存”，而是新旧镜像对模型结构、缓存布局或量化权重的识别方式不同。使用与 0731 DSpark 权重匹配的专用镜像后，日志给出了约 560K token 的 GPU KV Cache 容量，512K 单请求重新成立。
+
+结论：**上下文能力属于“权重 × 镜像 × 缓存实现 × 并行方式”的组合结果，不能只看卡的标称 HBM。**
+
+### 5. `/health=200` 不代表生成引擎一定健康
+
+本次最具迷惑性的现象是：
+
+```text
+GET /health -> HTTP 200
+POST /v1/chat/completions -> 120 秒没有任何正文
+metrics: Running=1, Waiting=0
+```
+
+健康接口只能证明 API 进程仍可响应。引擎可能已经在某个图、算子、调度形状或通信步骤中停滞。
+
+必须同时观察：
+
+```bash
+curl -s http://127.0.0.1:7000/metrics | \
+grep -E '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|prompt_tokens_total|generation_tokens_total){'
+```
+
+如果 `Running=1` 长时间不变，`generation_tokens_total` 不增长，而客户端没有收到正文，应按“生成停滞”处理，而不是继续等待健康检查变红。
+
+### 6. 用单变量实验定位 16K 批处理卡死
+
+曾经同时怀疑：
+
+- ACL Graph；
+- DSpark 投机解码；
+- 512K 上下文；
+- Reasonix 工具调用；
+- 反向代理超时；
+- `max_tokens=65536`；
+- `max-num-batched-tokens=16384`。
+
+正确做法是保留可回退容器，每次只修改一个变量。实验结果表明：
+
+- 关闭图执行并没有稳定解决卡住；
+- 关闭投机解码可以作为诊断，但会牺牲低并发解码速度；
+- 将 `max-num-batched-tokens` 从 16384 降至 8192 后，普通 API、基准请求和 Agent 多轮工具循环均能稳定完成。
+
+因此在本环境中，卡顿与 16K 调度预算/特定输入形状具有强相关性。它是实测结论，不应被扩展为“所有昇腾环境都只能用8192”。
+
+### 7. Agent 不回复，也可能是输出上限失控
+
+Reasonix 在未显式设置输出上限时，曾把一次请求转换为接近剩余上下文空间的 `max_tokens`，达到 50 万量级。即使模型最终会提前输出 EOS，这种请求也会给调度、超时和异常恢复带来额外风险。
+
+最终增加服务端约束：
+
+```bash
+--generation-config auto \
+--override-generation-config '{"max_new_tokens":65536}'
+```
+
+客户端继续保留大上下文窗口，但每次生成最多 64K。截断时 API 通常以 `finish_reason=length` 结束，客户端应保存已有结果，并发起“继续”请求，而不是把单轮输出无限放大。
+
+## 最终稳定参数
+
+| 参数 | 值 | 原因 |
+|---|---:|---|
+| 可见设备 | 0-7 | 固定在单个 8 卡高速互联域 |
+| TP | 8 | 单副本跨 8 卡 |
+| DP | 1 | 优先单请求稳定性，另 8 卡独立使用 |
+| 最大上下文 | 524288 | 业务需要，且匹配权重/镜像组合已验证 |
+| 最大批处理 token | 8192 | 避开本环境中 16K 形状卡顿 |
+| 最大序列数 | 16 | 控制并发与调度复杂度 |
+| HBM 利用率 | 0.93 | 在权重、运行时和缓存之间留余量 |
+| Chunked Prefill | 开 | 长输入分块处理 |
+| Prefix Cache | 关 | 避免与 MTP/混合模型的已知组合风险 |
+| Hybrid KV manager | 开 | 适配模型混合缓存布局 |
+| DSpark | 5 tokens | 实测平均接受长度约 2.2-3.8 |
+| ACL Graph | FULL_DECODE_ONLY | 降低 decode 调度开销 |
+| 最大输出 | 65536 | 防止 Agent 把剩余上下文全部当输出预算 |
+
+完整脱敏 Compose 见 [`examples/docker-compose.deepseek-v4.yml`](examples/docker-compose.deepseek-v4.yml)。
+
+## 性能结果应该怎样看
+
+本次稳定后的日志区间中：
+
+- 活跃生成吞吐通常约 35-55 token/s；
+- 部分短窗口峰值达到约 70-82 token/s；
+- DSpark draft 接受率随内容变化约 20%-60%；
+- 长输入 prefill 可达到数百至数千 token/s；
+- 请求结束后的 10 秒统计窗口可能显示很低吞吐，那只是窗口包含空闲时间。
+
+不要拿以下数据直接互比：
+
+- 单请求 decode token/s 与多并发总吞吐；
+- 短回答与长回答；
+- 冷启动首次图回放与预热后的请求；
+- prompt throughput 与 generation throughput；
+- DP2 总吞吐与 DP1 单用户延迟。
+
+第一次请求曾因 `Replaying aclgraph` 用时约 19 秒；相同服务预热后，三个 200 字左右请求分别约 4.36、2.87 和 3.29 秒。这正是为什么基准必须包含预热阶段。
+
+## 生产验证清单
+
+1. `docker inspect` 确认镜像、挂载和实际入口命令；
+2. `/health` 返回 200；
+3. `/v1/models` 能看到预期模型名；
+4. 非流式短请求完成；
+5. 流式请求能持续收到正文；
+6. 长 prompt 能完成 prefill；
+7. Agent 完成至少一次工具调用闭环；
+8. 指标最终回到 `Running=0 / Waiting=0 / KV=0`；
+9. 日志没有 `Aborted request`、Traceback 或引擎重启；
+10. 重启策略为 `unless-stopped`，同时保留可回退容器与原始 Compose。
+
+## 回滚原则
+
+不要在验证新方案时删除旧容器。推荐流程：
+
+```text
+旧容器停止 → 重命名保留
+新容器使用原服务名和端口启动
+验证失败 → 停止并重命名失败容器
+恢复旧容器名称 → 启动旧容器
+```
+
+容器重命名比立即删除更适合短周期试验；确认稳定运行至少一个业务周期后，再清理历史容器与重复权重。
+
+## 延伸阅读
+
+- [故障现象与判断矩阵](docs/troubleshooting.md)
+- [性能验证与指标解释](docs/performance-playbook.md)
+- [脱敏 Compose 示例](examples/docker-compose.deepseek-v4.yml)
+- [健康检查脚本](scripts/health-check.sh)
+- [实时观察脚本](scripts/observe.sh)
+
+## 免责声明
+
+本文是特定硬件与版本组合的工程实践，不代表厂商性能承诺。参数调整前请备份配置、保留回滚路径，并在非业务高峰验证。不要把示例中的占位符直接用于生产。
+

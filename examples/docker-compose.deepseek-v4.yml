@@ -1,0 +1,83 @@
+services:
+  vllm-deepseek:
+    image: ${DEEPSEEK_IMAGE:-quay.io/ascend/vllm-ascend:DeepSeekV4-flash-0731}
+    container_name: deepseek-vllm
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    shm_size: "512gb"
+    pids_limit: -1
+
+    environment:
+      - ASCEND_RT_VISIBLE_DEVICES=${DEEPSEEK_DEVICES:-0,1,2,3,4,5,6,7}
+      - OMP_NUM_THREADS=8
+      - OMP_PROC_BIND=false
+      - PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+      - TASK_QUEUE_ENABLE=1
+      - HCCL_BUFFSIZE=1024
+      - HCCL_OP_EXPANSION_MODE=AIV
+      - HCCL_SOCKET_IFNAME=${HOST_NIC:-bond0}
+      - VLLM_LOGGING_LEVEL=INFO
+
+    volumes:
+      - ${DEEPSEEK_MODEL_PATH:-/srv/models/DeepSeek-V4-Flash-0731-w8a8}:/models/deepseek:ro
+      - /usr/local/dcmi:/usr/local/dcmi:ro
+      - /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro
+      - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+      - /etc/ascend_install.info:/etc/ascend_install.info:ro
+      - /etc/hccn.conf:/etc/hccn.conf:ro
+
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      stack: {soft: 67108864, hard: 67108864}
+      nproc: {soft: 65536, hard: 65536}
+
+    entrypoint:
+      - bash
+      - -lc
+      - >-
+        exec vllm serve /models/deepseek
+        --served-model-name deepseek-v4-flash
+        --host 0.0.0.0
+        --port ${DEEPSEEK_PORT:-7000}
+        --tensor-parallel-size 8
+        --data-parallel-size 1
+        --enable-expert-parallel
+        --quantization ascend
+        --max-model-len 524288
+        --max-num-batched-tokens 8192
+        --max-num-seqs 16
+        --gpu-memory-utilization 0.93
+        --enable-chunked-prefill
+        --no-enable-prefix-caching
+        --no-disable-hybrid-kv-cache-manager
+        --block-size 128
+        --tokenizer-mode deepseek_v4
+        --tool-call-parser deepseek_v4
+        --enable-auto-tool-choice
+        --reasoning-parser deepseek_v4
+        --speculative-config '{"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+        --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+        --additional-config '{"enable_flashcomm1":false,"enable_dsa_cp":false}'
+        --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
+        --enable-log-requests
+        --enable-log-outputs
+        --no-enable-log-deltas
+        --max-log-len 0
+        --generation-config auto
+        --override-generation-config '{"max_new_tokens":65536}'
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:7000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 600s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "500m"
+        max-file: "10"
+
